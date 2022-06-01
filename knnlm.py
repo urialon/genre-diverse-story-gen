@@ -27,24 +27,28 @@ class KNNWrapper(LogitsProcessor):
         self.values = None
 
     def break_into(self, model):
-        # Inject our function in the beginning of generation
+        # Inject our hook function in the beginning of generation.
+        # When the "model.generate()" will be called, it will first call our "reset_generation()" function, 
+        # and only then call "model.generate()"
         self.original_generate_func = model.generate
         
-        def fake_generate(input_ids, **kwargs):
+        def pre_generate_hook(input_ids, **kwargs):
             self.reset_generation(input_ids)
             return self.original_generate_func(input_ids, **kwargs)
 
-        model.generate = fake_generate
+        model.generate = pre_generate_hook
 
         # Inject a logits processor to process the logits after the prediction
+        # When the model.generate() will call "_get_logits_processor", it will add our class as an additional logits processor,
+        # and thus will call our __call__() function below
         self.original_logits_processor_func = model._get_logits_processor
 
-        def fake_get_logits_processor(**kwargs):
+        def get_logits_processor_post_hook(**kwargs):
             logits_processor_list = self.original_logits_processor_func(**kwargs)
             logits_processor_list.append(self)
             return logits_processor_list
         
-        model._get_logits_processor = fake_get_logits_processor
+        model._get_logits_processor = get_logits_processor_post_hook
     
     def break_out(self, model):
         model._get_logits_processor = self.original_logits_processor_func
@@ -60,7 +64,9 @@ class KNNWrapper(LogitsProcessor):
         neg_dist = self.dist_func(query, self.keys)
         knn_log_probs = torch.nn.functional.softmax(neg_dist / self.knn_temperature, dim=-1) # (1, keys)
         knn_log_probs = torch.full(scores.shape, 0.0).scatter_add(dim=1, index=self.values, src=knn_log_probs).log() # (1, vocab)
+        knn_log_probs[knn_log_probs == float('-inf')] = -10000.0
 
+        scores = torch.nn.functional.log_softmax(scores, dim=-1)
         interpolated_scores = self.interpolate(knn_log_probs, scores, self.lmbda)
         
         return interpolated_scores
