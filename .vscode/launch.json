@@ -1,0 +1,26 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Generate",
+            "type": "python",
+            "request": "launch",
+            // "program": "${file}",
+            "program": "generate-clm.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--model_type", "gpt2",
+                "--model_name_or_path", "gpt2-story-gen",
+                "--prompt", "[ WP ] Space mining is on the rise . The Space tanker Exxon Valdez 2.0 crash and spill its cargo . Write a news story covering the event .",
+                "--length", "50",
+                "--knn",
+                "--knn_keytype", "last_ffn_input",
+                "--lmbda", "0.0001",
+            ],
+            "justMyCode": false
+        },
+    ]
+}

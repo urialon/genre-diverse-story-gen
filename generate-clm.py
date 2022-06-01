@@ -24,6 +24,8 @@ import logging
 import numpy as np
 import torch
 
+from knnlm import KEY_TYPE, KNNWrapper
+
 from transformers import (
     CTRLLMHeadModel,
     CTRLTokenizer,
@@ -196,6 +198,11 @@ def main():
         action="store_true",
         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
     )
+
+    parser.add_argument("--knn", action="store_true", help="Retrieve k-nearest-neighbors from the input")
+    parser.add_argument("--knn_keytype", default=KEY_TYPE.last_ffn_input, type=KEY_TYPE.from_string, choices=list(KEY_TYPE), required=False)
+    parser.add_argument("--lmbda", type=float, default=0.25, help="lmbda * KNN + (1-lmbda) * LM interpolation factor")
+    parser.add_argument("--knn_temp", type=float, default=1.0, help="knn temperature")
     args = parser.parse_args()
 
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
@@ -215,6 +222,10 @@ def main():
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
     model = model_class.from_pretrained(args.model_name_or_path)
     model.to(args.device)
+    # Uri: 
+    if args.knn:
+        knn_wrapper = KNNWrapper(args, model)
+        knn_wrapper.break_into(model)
 
     if args.fp16:
         model.half()
@@ -260,6 +271,7 @@ def main():
         num_return_sequences=args.num_return_sequences,
     )
 
+
     # Remove the batch dimension when returning multiple sequences
     if len(output_sequences.shape) > 2:
         output_sequences.squeeze_()
@@ -283,7 +295,11 @@ def main():
 
         generated_sequences.append(total_sequence)
         print(total_sequence)
-
+    
+    # Uri: 
+    if args.knn:
+        # Not necessary to break out, only if we want to continue using the model as usual.
+        knn_wrapper.break_out(model)
     return generated_sequences
 
 
