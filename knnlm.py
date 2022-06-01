@@ -49,6 +49,9 @@ class KNNWrapper(LogitsProcessor):
             return logits_processor_list
         
         model._get_logits_processor = get_logits_processor_post_hook
+        
+        # Save a reference to the wrapper
+        model.knn_wrapper = self
     
     def break_out(self, model):
         model._get_logits_processor = self.original_logits_processor_func
