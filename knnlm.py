@@ -35,12 +35,14 @@ class KNNWrapper(LogitsProcessor):
         self.lmbda = args.lmbda
         self.knn_temperature = args.knn_temp
         self.is_encoder_decoder = model.config.is_encoder_decoder
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         layer_to_capture = model_layer_to_capture[args.knn_keytype][self.is_encoder_decoder](model)
         self.activation_capturer = ActivationCapturer(layer_to_capture, capture_input=args.knn_keytype is KEY_TYPE.last_ffn_input)
 
         self.keys = None
         self.values = None
+        self.prompt_attention_mask = None
 
     def reset_generation(self, input_ids, **kwargs):
         self.prompt_input_ids = input_ids
@@ -48,14 +50,16 @@ class KNNWrapper(LogitsProcessor):
         self.values = None
         
         if self.is_encoder_decoder:
+            # If the model is an encoder-decoder, we encode the input using the *decoder* to create keys and values, 
+            # such that the keys will be similar to the queries
             self.prompt_attention_mask = kwargs['attention_mask']
             __ = self.model.base_model.decoder(
                     input_ids
                     # **kwargs
                 )
             
-            self.keys = self.activation_capturer.captured
-            self.values = self.prompt_input_ids[:, 1:]
+            self.keys = self.activation_capturer.captured.unsqueeze(1) # (batch, 1(beam), time, dim)
+            self.values = self.prompt_input_ids[:, 1:].unsqueeze(1) # (batch, 1(beam), time, time)
 
     def break_into(self, model):
         # Inject our hook function in the beginning of generation.
@@ -89,21 +93,24 @@ class KNNWrapper(LogitsProcessor):
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
         if not self.is_encoder_decoder and self.keys is None:
+            # If the model is a decoder-only, the keys and the values are the prefix of the input_ids
             prompt_length = self.prompt_input_ids.shape[1] - 1
-            self.keys = self.activation_capturer.captured[:, :prompt_length]
-            self.values = self.prompt_input_ids[:, 1:prompt_length+1]
+            self.keys = self.activation_capturer.captured[:, :prompt_length] # (batch, time, dim)
+            self.values = self.prompt_input_ids[:, 1:prompt_length+1] # (batch, time, time)
 
-        query = self.activation_capturer.captured[:, -1]
+        query = self.activation_capturer.captured[:, -1].reshape(-1, self.model.config.num_beams, self.keys.shape[-1]) # (batch, beams, dim)
 
-        # if num_beams > 1:
-        # expanded_return_idx = (
-        #     torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
-        # )
-        # input_ids = input_ids.index_select(0, expanded_return_idx)
-
-        neg_dist = self.dist_func(query, self.keys)
-        knn_log_probs = torch.nn.functional.softmax(neg_dist / self.knn_temperature, dim=-1) # (1, keys)
-        knn_log_probs = torch.full(scores.shape, 0.0).scatter_add(dim=1, index=self.values, src=knn_log_probs).log() # (1, vocab)
+        neg_dist = self.dist_func(query, self.keys) # (batch, beams, time)
+        if self.prompt_attention_mask is None:
+            masked_neg_dist = neg_dist
+        else:    
+            masked_neg_dist = neg_dist + self.prompt_attention_mask.log().unsqueeze(1)
+        knn_log_probs = torch.nn.functional.softmax(masked_neg_dist / self.knn_temperature, dim=-1) # (batch, beams, time)
+        knn_log_probs = torch.full(scores.shape, 0.0).to(self.device).scatter_add(
+            dim=1, 
+            index=self.values.repeat(1, self.model.config.num_beams, 1).flatten(0, 1), 
+            src=knn_log_probs.flatten(0, 1),
+        ).log() # (batch * beam, vocab)
         knn_log_probs[knn_log_probs == float('-inf')] = -10000.0
 
         if self.model.config.num_beams == 1:
@@ -116,7 +123,10 @@ class KNNWrapper(LogitsProcessor):
         return interpolated_scores
 
     def dist_func(self, query, keys):
-        return -torch.sum((query.unsqueeze(0) - keys)**2, dim=2)
+        # query: (batch, beams, dim)
+        # keys:  (batch, 1, time, dim)
+        # returns: (batch, beams, time)
+        return -torch.sum((query.unsqueeze(2) - keys)**2, dim=-1)
 
     def interpolate(self, knn_log_probs, lm_log_probs, lmbda):
         combine_probs = torch.stack([lm_log_probs, knn_log_probs], dim=0)
